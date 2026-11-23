@@ -1,0 +1,231 @@
+# CI/CD pipeline
+#
+#   Code change -> git push -> unit tests -> build -> artifact -> AWS S3 -> deploy -> live production
+#
+# Each job only starts if the ones before it succeeded, so failing tests OR a failing security
+# scan (secrets, vulnerable dependencies, insecure code) stop everything and nothing reaches
+# S3 or the server.
+#
+# Repository secrets used (Settings > Secrets and variables > Actions):
+#   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY   access keys of the limited "github-deployer" IAM user
+#   AWS_REGION                                  e.g. ap-southeast-1
+#   S3_BUCKET                                   name of the S3 bucket that stores the builds
+#   EC2_INSTANCE_ID                             e.g. i-0123456789abcdef0
+#   APP_URL                                     e.g. http://203.0.113.10  (public address of the app)
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # lets you re-run the whole pipeline by hand from the Actions tab
+
+permissions:
+  contents: read
+
+# Never run two deployments at the same time
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------- 1. UNIT TESTS
+  test:
+    name: "1 - Unit tests"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run unit tests (the pipeline stops here if any test fails)
+        run: python -m pytest -v
+
+  # ---------------------------------------------------------------- 1b. SECURITY (DevSecOps bonus)
+  security:
+    name: "1b - Security scans"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Gitleaks also scans the git history
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Secret scan (Gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Dependency vulnerability scan (pip-audit)
+        run: |
+          pip install pip-audit
+          pip-audit -r requirements.txt
+
+      - name: Static code analysis / SAST (Semgrep)
+        run: |
+          pip install semgrep
+          semgrep scan --config p/python --error app scripts
+
+  # ---------------------------------------------------------------- 2. BUILD
+  build:
+    name: "2 - Build package"
+    needs: [test, security]
+    runs-on: ubuntu-latest
+    outputs:
+      artifact: ${{ steps.package.outputs.artifact }}
+      build_id: ${{ steps.package.outputs.build_id }}
+      version: ${{ steps.package.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Package the application (build-VERSION-RUN-SHA.zip)
+        id: package
+        run: python scripts/package.py
+
+      - name: Keep the build as a GitHub artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-package
+          path: dist/*.zip
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- 3. S3
+  upload:
+    name: "3 - Upload build to S3"
+    needs: build
+    runs-on: ubuntu-latest
+    env:
+      BUCKET: ${{ secrets.S3_BUCKET }}
+      ARTIFACT: ${{ needs.build.outputs.artifact }}
+    steps:
+      - uses: actions/checkout@v4 # for deploy/deploy.sh
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-package
+          path: dist
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Upload the build zip to S3
+        run: |
+          aws s3 cp "dist/$ARTIFACT" "s3://$BUCKET/builds/$ARTIFACT"
+          echo "Uploaded s3://$BUCKET/builds/$ARTIFACT"
+
+      - name: Publish the deploy script next to the builds
+        run: aws s3 cp deploy/deploy.sh "s3://$BUCKET/deploy/deploy.sh"
+
+      - name: Mark this build as the latest successful build
+        run: |
+          echo "builds/$ARTIFACT" > latest.txt
+          aws s3 cp latest.txt "s3://$BUCKET/latest.txt"
+          echo "latest.txt now points to builds/$ARTIFACT"
+
+  # ---------------------------------------------------------------- 4. DEPLOY
+  deploy:
+    name: "4 - Deploy latest build to EC2"
+    needs: [build, upload]
+    runs-on: ubuntu-latest
+    env:
+      BUCKET: ${{ secrets.S3_BUCKET }}
+      INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+      REGION: ${{ secrets.AWS_REGION }}
+      APP_URL: ${{ secrets.APP_URL }}
+      EXPECTED_BUILD: ${{ needs.build.outputs.build_id }}
+      VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      # The server itself fetches the latest successful build from S3 (see deploy/deploy.sh)
+      - name: Tell the server to deploy the latest build from S3
+        run: |
+          PARAMS="$(jq -n --arg b "$BUCKET" --arg r "$REGION" '{
+            commands: [
+              "export AWS_DEFAULT_REGION=\($r)",
+              "/usr/local/bin/aws s3 cp s3://\($b)/deploy/deploy.sh /tmp/deploy.sh --only-show-errors",
+              "bash /tmp/deploy.sh \($b)"
+            ],
+            executionTimeout: ["900"]
+          }')"
+          COMMAND_ID="$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --comment "Deploy build $EXPECTED_BUILD" \
+            --parameters "$PARAMS" \
+            --query "Command.CommandId" --output text)"
+          echo "Started SSM command $COMMAND_ID"
+          echo "COMMAND_ID=$COMMAND_ID" >> "$GITHUB_ENV"
+
+      - name: Wait for the deployment and show the server log
+        run: |
+          STATUS="Pending"
+          for i in $(seq 1 90); do
+            STATUS="$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+              --query Status --output text 2>/dev/null || echo Pending)"
+            echo "[$i] $STATUS"
+            case "$STATUS" in
+              Success|Failed|Cancelled|TimedOut) break ;;
+            esac
+            sleep 10
+          done
+          echo "------------------- server output -------------------"
+          aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+            --query StandardOutputContent --output text || true
+          echo "------------------- server errors -------------------"
+          aws ssm get-command-invocation --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+            --query StandardErrorContent --output text || true
+          if [ "$STATUS" != "Success" ]; then
+            echo "::error::The deployment on the server did not succeed (status: $STATUS)"
+            exit 1
+          fi
+
+      # Proof from the outside: the PUBLIC address must now serve exactly this build
+      - name: Verify production is serving this build
+        run: |
+          if [ -z "$APP_URL" ]; then
+            echo "::warning::The APP_URL secret is not set, so the public check was skipped"
+            exit 0
+          fi
+          URL="${APP_URL%/}"
+          for i in $(seq 1 24); do
+            BODY="$(curl -fsS --max-time 10 "$URL/health" || true)"
+            echo "[$i] $BODY"
+            if echo "$BODY" | grep -Eq "\"build\" *: *\"$EXPECTED_BUILD\""; then
+              echo "Production is serving build $EXPECTED_BUILD (version $VERSION)"
+              {
+                echo "### Deployed to production"
+                echo "- Version: **$VERSION**"
+                echo "- Build: \`$EXPECTED_BUILD\`"
+                echo "- Live at: $URL"
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error::Production is not serving build $EXPECTED_BUILD"
+          exit 1

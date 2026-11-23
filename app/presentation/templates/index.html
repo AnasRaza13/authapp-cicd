@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% if user %}Welcome{% elif mode == "register" %}Create account{% else %}Log in{% endif %} · AuthApp</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='style.css') }}">
+</head>
+<body>
+  <main class="card">
+    <h1 class="brand">AuthApp</h1>
+
+    {% if user %}
+      <!-- ============ LOGGED-IN VIEW ============ -->
+      <h2>Welcome, {{ user.username }} 👋</h2>
+      <p class="muted">You are logged in to <strong>{{ user.tenant.name }}</strong>.</p>
+      <dl class="details">
+        <dt>Company</dt><dd>{{ user.tenant.name }}</dd>
+        <dt>Role</dt><dd><span class="badge {{ user.role }}">{{ user.role }}</span></dd>
+        <dt>Email</dt><dd>{{ user.email }}</dd>
+        <dt>Member since</dt><dd>{{ user.created_at.strftime("%d %b %Y") }}</dd>
+      </dl>
+
+      <h3 class="section">Members of {{ user.tenant.name }}</h3>
+      <ul class="members">
+        {% for m in members %}
+          <li>
+            <span>{{ m.username }}{% if m.id == user.id %} <em>(you)</em>{% endif %}</span>
+            <span class="badge {{ m.role }}">{{ m.role }}</span>
+          </li>
+        {% endfor %}
+      </ul>
+      <p class="hint">You only see people from your own company. Other companies' data is isolated by tenant_id.</p>
+
+      <form method="post" action="/logout">
+        <button type="submit" class="btn">Log out</button>
+      </form>
+
+    {% else %}
+      <!-- ============ TABS ============ -->
+      <nav class="tabs">
+        <a href="/?mode=login" class="{{ 'active' if mode == 'login' }}">Log in</a>
+        <a href="/?mode=register" class="{{ 'active' if mode == 'register' }}">Register</a>
+      </nav>
+
+      {% if error %}<div class="alert error" role="alert">{{ error }}</div>{% endif %}
+      {% if success %}<div class="alert success" role="status">{{ success }}</div>{% endif %}
+
+      {% if mode == "register" %}
+        <!-- ============ REGISTER FORM ============ -->
+        <form method="post" action="/register" novalidate>
+          <label>Company
+            <input type="text" name="company" value="{{ form.company if form }}" autocomplete="organization" required autofocus>
+            <span class="hint">A new name creates a company and you become its admin. An existing name joins it as a member.</span>
+          </label>
+          <label>Username
+            <input type="text" name="username" value="{{ form.username if form }}" autocomplete="username" required>
+          </label>
+          <label>Email
+            <input type="email" name="email" value="{{ form.email if form }}" autocomplete="email" required>
+          </label>
+          <label>Password
+            <input type="password" name="password" autocomplete="new-password" required>
+          </label>
+          <label>Confirm password
+            <input type="password" name="confirm_password" autocomplete="new-password" required>
+          </label>
+          <button type="submit" class="btn">Create account</button>
+        </form>
+      {% else %}
+        <!-- ============ LOGIN FORM ============ -->
+        <form method="post" action="/login" novalidate>
+          <label>Company
+            <input type="text" name="company" value="{{ form.company if form }}" autocomplete="organization" required autofocus>
+          </label>
+          <label>Username
+            <input type="text" name="username" value="{{ form.username if form }}" autocomplete="username" required>
+          </label>
+          <label>Password
+            <input type="password" name="password" autocomplete="current-password" required>
+          </label>
+          <button type="submit" class="btn">Log in</button>
+        </form>
+      {% endif %}
+    {% endif %}
+    <p class="version">Version {{ app_version }} &middot; build {{ build_id }}</p>
+  </main>
+</body>
+</html>

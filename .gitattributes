@@ -1,0 +1,6 @@
+# The server runs Linux: these files must keep Unix (LF) line endings even when
+# they are committed from Windows, or the scripts break on the server.
+*.sh  text eol=lf
+*.yml text eol=lf
+*.json text eol=lf
+VERSION text eol=lf
